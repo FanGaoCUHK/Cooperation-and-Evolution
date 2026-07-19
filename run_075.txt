@@ -1,0 +1,19 @@
+策略描述：
+
+1. 初始设置：定义变量`betrayCount`（对手累计背叛次数）和`consecutiveBetray`（对手连续背叛次数），均初始化为0。设定阈值`THRESHOLD = 2`。定义`mutualDefectCount`（连续相互欺骗轮数）初始为0。定义`permanentDefect`标志（永久欺骗）初始为False。
+
+2. 第一轮：总是选择合作（C）。
+
+3. 第2至25轮：
+   - 更新对手行为记录：若对手上一轮选D，则`betrayCount`加1，`consecutiveBetray`加1；否则将`consecutiveBetray`重置为0。
+   - 若`permanentDefect`为True，则始终选D。
+   - 否则，若`betrayCount >= THRESHOLD`（即对手累计背叛至少2次），进入“警惕模式”：
+     - 若对手上一轮选C，则选C；若对手上一轮选D，则选D（即模仿对手上一轮行为）。
+     - 但若当前轮次连续相互欺骗（即双方都选D）达到3轮，则下一轮主动选C作为试探。若试探后对手也选C，则重置`mutualDefectCount`并恢复正常模仿；若对手选D，则设置`permanentDefect = True`，此后始终选D。
+   - 若`betrayCount < THRESHOLD`（对手友好），采用标准“一报还一报”策略：本轮选对手上一轮的策略（即若对手上一轮C，则选C；若对手上一轮D，则选D）。不进行额外原谅。
+
+4. 第26至29轮（后期）：
+   - 若`betrayCount >= 2`，则始终选D。
+   - 否则（对手从未或仅背叛一次），继续采用“一报还一报”：本轮选对手上一轮的策略（即模仿）。但注意：若对手上一轮选C，则选C；若对手上一轮选D，则选D。
+
+5. 第30轮（最后一轮）：始终选D，无论之前行为如何。
