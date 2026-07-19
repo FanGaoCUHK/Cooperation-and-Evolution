@@ -6,20 +6,18 @@ from itertools import combinations
 import warnings
 import os
 import glob
-import re
+import json
+import time
+from openai import OpenAI
 
-plt.rcParams['font.sans-serif'] = ['SimHei']  
-plt.rcParams['axes.unicode_minus'] = False  
-
-warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+os.environ["OPENAI_API_KEY"] = "your-api-key"
+client = OpenAI()
 
 plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans', 'Liberation Sans', 'Bitstream Vera Sans', 'sans-serif']
-plt.rcParams['axes.unicode_minus'] = False  
-
+plt.rcParams['axes.unicode_minus'] = False
 
 COOPERATE = 'C'
 DEFECT = 'D'
-
 
 def payoff(my_move, opp_move):
     if my_move == COOPERATE and opp_move == COOPERATE:
@@ -32,77 +30,77 @@ def payoff(my_move, opp_move):
         return 0
 
 STRATEGY_FOLDER = r"E:\coin\AI\AI strategy-raw data"
-ALL_AI_TEXTS = []   
+ALL_AI_TEXTS = []
+STRATEGY_CACHE = {}
 
 def load_all_strategy_texts(folder_path):
-    """读取文件夹下所有 run_*.txt 文件，返回文本列表"""
     texts = []
     pattern = os.path.join(folder_path, "run_*.txt")
     files = sorted(glob.glob(pattern))
     if not files:
-        raise FileNotFoundError(f"未找到策略文件，请检查路径：{folder_path}")
+        raise FileNotFoundError(f"未找到策略文件: {folder_path}")
     for fpath in files:
         with open(fpath, 'r', encoding='utf-8') as f:
-            text = f.read()
-        texts.append(text)
+            texts.append(f.read())
     return texts
 
 ALL_AI_TEXTS = load_all_strategy_texts(STRATEGY_FOLDER)
 
-def parse_strategy_text(text):
-    """
-    从自然语言策略文本中提取规则，返回一个字典 rules，包含：
-      - initial_move: 'C' 或 'D'
-      - phases: 列表，每个元素为 (start, end, type, params)
-         type 可以是 'always_C', 'always_D', 'TFT', 'forgiving_TFT' 等
-      - special_forgive: (连续背叛次数阈值, 动作) 或 None
-    解析逻辑针对常见的结构：第1轮单独给出；中间轮次基于TFT+偶尔原谅；终局全部背叛。
-    """
-    rules = {
-        'initial_move': COOPERATE,   
-        'phases': [],              
-        'forgive_after_consecutive': None  
-    }
-    
-    first_match = re.search(r'第\s*1\s*轮[：:]\s*选择\s*(合作|欺骗)', text)
-    if first_match:
-        decision_word = first_match.group(1)
-        rules['initial_move'] = COOPERATE if '合作' in decision_word else DEFECT
+def parse_strategy_with_llm(text):
+    if text in STRATEGY_CACHE:
+        return STRATEGY_CACHE[text]
+    prompt = f"""You are a player. Extract the strategy from the following description and return a JSON object with these fields:
+- initial_move: "C" or "D"
+- phases: list of phase objects, each with start (int), end (int), rule (string), and optional params (dict). Rule can be "always" (params: {{"action": "C" or "D"}}), "TFT", or "TFT_with_forgive".
+- forgive_after_consecutive: null or an object {{"count": int, "action": "C" or "D"}} if the strategy forgives after a certain number of consecutive defections.
 
-    endgame_match = re.search(r'第\s*(\d+)\s*轮\s*至\s*第?\s*30\s*轮[：:]\s*无论对手历史行为如何，?\s*全部\s*(合作|欺骗)', text)
-    if endgame_match:
-        endgame_start = int(endgame_match.group(1))
-        end_action = COOPERATE if '合作' in endgame_match.group(2) else DEFECT
-        rules['phases'].append((endgame_start, 30, 'always', end_action))
-    
-    middle_match = re.search(r'第\s*(\d+)\s*轮\s*至\s*第?\s*(\d+)\s*轮[：:]', text)
-    if middle_match:
-        start = int(middle_match.group(1))
-        end = int(middle_match.group(2))
-        if re.search(r'对手上一轮选择合作.*本轮选择合作', text) and re.search(r'对手上一轮选择欺骗.*本轮选择欺骗', text):
-            rule_type = 'TFT'
-            forgive_match = re.search(r'连续欺骗了\s*(\d+)\s*轮.*下一轮.*合作', text)
-            if forgive_match:
-                consecutive_n = int(forgive_match.group(1))
-                rules['forgive_after_consecutive'] = (consecutive_n, COOPERATE)
-                rule_type = 'TFT_with_forgive'
-            rules['phases'].append((start, end, rule_type, None))
-        else:
-            rules['phases'].append((start, end, 'TFT', None))
-    
-    if not rules['phases']:
-        rules['phases'].append((1, 30, 'TFT', None))
-    
-    return rules
+Return only the JSON. No other text.
+Strategy description:
+{text}"""
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model="model",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=500
+            )
+            content = response.choices[0].message.content.strip()
+            parsed = json.loads(content)
+            rules = {
+                'initial_move': parsed.get('initial_move', 'C'),
+                'phases': [],
+                'forgive_after_consecutive': None
+            }
+            for ph in parsed.get('phases', []):
+                start = int(ph['start'])
+                end = int(ph['end'])
+                rule = ph['rule']
+                if rule == 'always':
+                    action = ph.get('params', {}).get('action', 'C')
+                    rules['phases'].append((start, end, 'always', action))
+                elif rule == 'TFT':
+                    rules['phases'].append((start, end, 'TFT', None))
+                elif rule == 'TFT_with_forgive':
+                    rules['phases'].append((start, end, 'TFT_with_forgive', None))
+            if 'forgive_after_consecutive' in parsed and parsed['forgive_after_consecutive']:
+                fc = parsed['forgive_after_consecutive']
+                rules['forgive_after_consecutive'] = (int(fc['count']), fc['action'])
+            STRATEGY_CACHE[text] = rules
+            return rules
+        except Exception as e:
+            time.sleep(1)
+    fallback = {'initial_move': 'C', 'phases': [(1, 30, 'TFT', None)], 'forgive_after_consecutive': None}
+    STRATEGY_CACHE[text] = fallback
+    return fallback
 
 class Player:
     def __init__(self, strategy):
         self.strategy = strategy
         self.total_score = 0
-        
         if self.strategy == 'AI':
             chosen_text = random.choice(ALL_AI_TEXTS)
-            self.ai_rules = parse_strategy_text(chosen_text)
+            self.ai_rules = parse_strategy_with_llm(chosen_text)
         self.reset_game()
     
     def reset_game(self):
@@ -149,7 +147,6 @@ class Player:
             rules = self.ai_rules
             if round_num == 1:
                 return rules['initial_move']
-            
             current_phase = None
             for start, end, rtype, extra in rules['phases']:
                 if start <= round_num <= end:
@@ -157,12 +154,9 @@ class Player:
                     break
             if current_phase is None:
                 return self.opponent_last_move if self.opponent_last_move is not None else COOPERATE
-            
             phase_start, phase_end, rtype, extra = current_phase
-            
             if rtype == 'always':
-                return extra  
-            
+                return extra
             if rtype in ('TFT', 'TFT_with_forgive'):
                 forgive_rule = rules.get('forgive_after_consecutive')
                 if forgive_rule and not self.just_forgave:
@@ -173,20 +167,17 @@ class Player:
                 if self.opponent_last_move is not None:
                     return self.opponent_last_move
                 else:
-                    return COOPERATE  
-            
-            return COOPERATE  
+                    return COOPERATE
+            return COOPERATE
                     
     def update_after_move(self, self_move, opp_move, round_num, pay):
         self.opponent_last_move = opp_move
-        
         if self.strategy == 'AI':
             if opp_move == DEFECT:
                 self.consecutive_opp_defects += 1
             else:
                 self.consecutive_opp_defects = 0
-                self.just_forgave = False   
-        
+                self.just_forgave = False
         if self.strategy == 'AI' and opp_move == DEFECT:
             self.betrayed_count += 1
         if self.strategy == 'WSLS':
@@ -217,7 +208,6 @@ all_strategies = human_strategies + ['AI']
 for gen in range(num_generations):
     for player in players:
         player.total_score = 0
-    
     for sim in range(num_simulations):
         random.shuffle(players)
         for i in range(0, len(players), 2):
@@ -234,24 +224,20 @@ for gen in range(num_generations):
                 p2.total_score += pay2
                 p1.update_after_move(move1, move2, round_num, pay1)
                 p2.update_after_move(move2, move1, round_num, pay2)
-    
     scores_dict = {s: [] for s in all_strategies}
     counts_dict = {s: 0 for s in all_strategies}
     for player in players:
         if player.strategy in scores_dict:
             scores_dict[player.strategy].append(player.total_score)
             counts_dict[player.strategy] += 1
-    
     avg_scores = {}
     for strategy, scores in scores_dict.items():
         if scores:
             avg_scores[strategy] = np.mean(scores)
         else:
             avg_scores[strategy] = 0
-    
     generation_scores.append(avg_scores)
     generation_counts.append(counts_dict)
-    
     valid_strategies = [s for s in all_strategies if len(scores_dict[s]) >= 2]
     if len(valid_strategies) >= 2:
         anova_data = [scores_dict[s] for s in valid_strategies]
@@ -280,7 +266,6 @@ for gen in range(num_generations):
         for strategy in all_strategies:
             print(f"  {strategy}: 平均分 = {avg_scores[strategy]:.2f}, 数量 = {counts_dict[strategy]}")
         print("  ANOVA: 数据不足，无法进行分析")
-    
     if gen < num_generations - 1:
         players.sort(key=lambda x: x.total_score)
         players = players[num_eliminate:]
